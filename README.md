@@ -4,6 +4,7 @@ Slackcat is a simple commandline utility to post snippets to Slack.
 
   <img width="500px" src="https://raw.githubusercontent.com/vektorlab/slackcat/master/demo.gif" alt="slackcat"/>
 
+## Made some changes
 
 ## Usage
 Pipe command output:
@@ -43,7 +44,7 @@ sudo chmod +x /usr/local/bin/slackcat
 Generate a new Slack token with:
 ```bash
 slackcat --configure
-``` 
+```
 A new browser window will be opened for you to confirm the request via Slack, and you'll be returned a token.
 
 Create a Slackcat config file and you're ready to go!
