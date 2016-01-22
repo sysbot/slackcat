@@ -1,196 +1,139 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bluele/slack"
-	"github.com/codegangsta/cli"
-	"github.com/fatih/color"
-	"github.com/skratchdot/open-golang/open"
 )
 
-var version = "dev-build"
-
-const (
-	base_url  = "https://slack.com/oauth/authorize"
-	client_id = "7065709201.17699618306"
-	scope     = "channels%3Aread+groups%3Aread+im%3Aread+users%3Aread+chat%3Awrite%3Auser+files%3Awrite%3Auser+files%3Aread"
-)
-
-func getConfigPath() string {
-	homedir := os.Getenv("HOME")
-	if homedir == "" {
-		exit(fmt.Errorf("$HOME not set"))
-	}
-	return homedir + "/.slackcat"
+type SlackCat struct {
+	api         *slack.Slack
+	opts        *slack.ChatPostMessageOpt
+	queue       *StreamQ
+	shutdown    chan os.Signal
+	channelName string
+	channelId   string
 }
 
-func readConfig() string {
-	path := getConfigPath()
-	file, err := os.Open(path)
-	failOnError(err, "unable to read config", true)
-	defer file.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+func newSlackCat(token, channelName string) (*SlackCat, error) {
+	sc := &SlackCat{
+		api:         slack.New(token),
+		opts:        &slack.ChatPostMessageOpt{AsUser: true},
+		queue:       newStreamQ(),
+		shutdown:    make(chan os.Signal, 1),
+		channelName: channelName,
 	}
-
-	return lines[0]
-}
-
-func configureOA() {
-	oa_url := base_url + "?scope=" + scope + "&client_id=" + client_id
-	output("Creating token request for Slackcat")
-	err := open.Run(oa_url)
+	err := sc.lookupSlackId()
 	if err != nil {
-		output("Please open the below URL in your browser to authorize SlackCat")
-		output(oa_url)
+		return nil, err
 	}
-	//	_, err := fmt.Scanf("%s", &i)
-	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	failOnError(err, "", true)
-	fmt.Println(dir)
-	os.Exit(0)
+	signal.Notify(sc.shutdown, os.Interrupt)
+	return sc, nil
 }
 
-func readIn(lines chan string, tee bool) {
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Split(bufio.ScanLines)
-	for scanner.Scan() {
-		lines <- scanner.Text()
-		if tee {
-			fmt.Println(scanner.Text())
+func (sc *SlackCat) trap() {
+	sigcount := 0
+	for sig := range sc.shutdown {
+		if sigcount > 0 {
+			exitErr(fmt.Errorf("aborted"))
+		}
+		output(fmt.Sprintf("got signal: %s", sig.String()))
+		output("press ctrl+c again to exit immediately")
+		sigcount++
+		go sc.exit()
+	}
+}
+
+func (sc *SlackCat) exit() {
+	for {
+		if sc.queue.isEmpty() {
+			os.Exit(0)
+		} else {
+			output("flushing remaining messages to Slack...")
+			time.Sleep(3 * time.Second)
 		}
 	}
-	close(lines)
 }
 
-func writeTemp(lines chan string) string {
-	tmp, err := ioutil.TempFile(os.TempDir(), "slackcat-")
-	failOnError(err, "unable to create tmpfile", false)
+//Lookup Slack id for channel, group, or im
+func (sc *SlackCat) lookupSlackId() error {
+	api := sc.api
+	channel, err := api.FindChannelByName(sc.channelName)
+	if err == nil {
+		sc.channelId = channel.Id
+		return nil
+	}
+	group, err := api.FindGroupByName(sc.channelName)
+	if err == nil {
+		sc.channelId = group.Id
+		return nil
+	}
+	im, err := api.FindImByName(sc.channelName)
+	if err == nil {
+		sc.channelId = im.Id
+		return nil
+	}
+	fmt.Println(err)
+	return fmt.Errorf("No such channel, group, or im")
+}
 
-	w := bufio.NewWriter(tmp)
+func (sc *SlackCat) addToStreamQ(lines chan string) {
 	for line := range lines {
-		fmt.Fprintln(w, line)
+		sc.queue.add(line)
 	}
-	w.Flush()
-
-	return tmp.Name()
+	sc.exit()
 }
 
-func output(s string) {
-	cyan := color.New(color.Bold).SprintFunc()
-	fmt.Printf("%s %s\n", cyan("slackcat"), s)
-}
-
-func failOnError(err error, msg string, appendErr bool) {
-	if err != nil {
-		if appendErr {
-			exit(fmt.Errorf("%s: %s", msg, err))
+//TODO: handle messages with length exceeding maximum for Slack chat
+func (sc *SlackCat) processStreamQ(noop bool, plain bool) {
+	if !(sc.queue.isEmpty()) {
+		msglines := sc.queue.flush()
+		if noop {
+			output(fmt.Sprintf("skipped posting of %s message lines to %s", strconv.Itoa(len(msglines)), sc.channelName))
 		} else {
-			exit(fmt.Errorf("%s", msg))
+			sc.postMsg(msglines, plain)
 		}
 	}
+	time.Sleep(3 * time.Second)
+	sc.processStreamQ(noop, plain)
 }
 
-func exit(err error) {
-	output(color.RedString(err.Error()))
-	os.Exit(1)
+func (sc *SlackCat) postMsg(msglines []string, plain bool) {
+	fmtStr := "```%s```"
+	if plain {
+		fmtStr = "%s"
+	}
+	msg := fmt.Sprintf(fmtStr, strings.Join(msglines, "\n"))
+	err := sc.api.ChatPostMessage(sc.channelId, msg, sc.opts)
+	failOnError(err, "", true)
+	output(fmt.Sprintf("posted %s message lines to %s", strconv.Itoa(len(msglines)), sc.channelName))
 }
 
-func main() {
-	app := cli.NewApp()
-	app.Name = "slackcat"
-	app.Usage = "redirect a file to slack"
-	app.Version = version
-	app.Flags = []cli.Flag{
-		cli.BoolFlag{
-			Name:  "tee, t",
-			Usage: "Print stdin to screen before posting",
-		},
-		cli.BoolFlag{
-			Name:  "noop",
-			Usage: "Skip posting file to Slack. Useful for testing",
-		},
-		cli.BoolFlag{
-			Name:  "configure",
-			Usage: "Configure Slackcat via oauth",
-		},
-		cli.StringFlag{
-			Name:  "channel, c",
-			Usage: "Slack channel or group to post to",
-		},
-		cli.StringFlag{
-			Name:  "filename, n",
-			Usage: "Filename for upload. Defaults to current timestamp",
-		},
+func (sc *SlackCat) postFile(filePath, fileName string, noop bool) {
+	//default to timestamp for filename
+	if fileName == "" {
+		fileName = strconv.FormatInt(time.Now().Unix(), 10)
 	}
 
-	app.Action = func(c *cli.Context) {
-		var filePath string
-		var fileName string
-		var channelId string
-
-		if c.Bool("configure") {
-			configureOA()
-		}
-
-		token := readConfig()
-		api := slack.New(token)
-
-		if c.String("channel") == "" {
-			exit(fmt.Errorf("no channel provided!"))
-		}
-
-		channel, err := api.FindChannelByName(c.String("channel"))
-		if err != nil {
-			group, err := api.FindGroupByName(c.String("channel"))
-			failOnError(err, "Slack API error", true)
-			channelId = group.Id
-		} else {
-			channelId = channel.Id
-		}
-
-		if len(c.Args()) > 0 {
-			filePath = c.Args()[0]
-			fileName = filepath.Base(filePath)
-		} else {
-			lines := make(chan string)
-			go readIn(lines, c.Bool("tee"))
-			filePath = writeTemp(lines)
-			fileName = strconv.FormatInt(time.Now().Unix(), 10)
-			defer os.Remove(filePath)
-		}
-
-		//override default filename with provided option value
-		if c.String("filename") != "" {
-			fileName = c.String("filename")
-		}
-
-		if c.Bool("noop") {
-			output(fmt.Sprintf("skipping upload of file %s to %s", fileName, c.String("channel")))
-		} else {
-			start := time.Now()
-			err = api.FilesUpload(&slack.FilesUploadOpt{
-				Filepath: filePath,
-				Filename: fileName,
-				Title:    fileName,
-				Channels: []string{channelId},
-			})
-			failOnError(err, "error uploading file to Slack", true)
-			duration := strconv.FormatFloat(time.Since(start).Seconds(), 'f', 3, 64)
-			output(fmt.Sprintf("file %s uploaded to %s (%ss)", fileName, c.String("channel"), duration))
-		}
+	if noop {
+		output(fmt.Sprintf("skipping upload of file %s to %s", fileName, sc.channelName))
+		return
 	}
 
-	app.Run(os.Args)
-
+	start := time.Now()
+	err := sc.api.FilesUpload(&slack.FilesUploadOpt{
+		Filepath: filePath,
+		Filename: fileName,
+		Title:    fileName,
+		Channels: []string{sc.channelId},
+	})
+	failOnError(err, "error uploading file to Slack", true)
+	duration := strconv.FormatFloat(time.Since(start).Seconds(), 'f', 3, 64)
+	output(fmt.Sprintf("file %s uploaded to %s (%ss)", fileName, sc.channelName, duration))
+	os.Exit(0)
 }
