@@ -22,6 +22,9 @@ func readIn(lines chan string, tee bool) {
 			fmt.Println(scanner.Text())
 		}
 	}
+	fmt.Println("just testing")
+	fmt.Println("new branch")
+
 	close(lines)
 }
 

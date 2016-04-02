@@ -21,13 +21,6 @@ type Config struct {
 	defaultChannel string
 }
 
-func getConfigPath() string {
-	homedir := os.Getenv("HOME")
-	if homedir == "" {
-		exitErr(fmt.Errorf("$HOME not set"))
-	}
-	return homedir + "/.slackcat"
-}
 
 func (c *Config) parseChannelOpt(channel string) (string, string, error) {
 	//use default channel if none provided
